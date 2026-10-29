@@ -1,0 +1,44 @@
+/*
+ * The per-CPU TranslationBlock jump cache.
+ *
+ *  Copyright (c) 2003 Fabrice Bellard
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef ACCEL_TCG_TB_JMP_CACHE_H
+#define ACCEL_TCG_TB_JMP_CACHE_H
+
+/*
+ * ★★★ РАЗМЕР КЭША ПЕРЕХОДОВ: 12 → 14 РАЗРЯДОВ.
+ *
+ * Профиль потока интерфейса гостя (листание рабочего стола,
+ * simpleperf по потоку рабочего стола прошивки) показал, куда уходит время:
+ *
+ *   22,7 %  helper_lookup_tb_ptr   поиск следующего блока перевода
+ *    6,3 %  tb_htable_lookup       промах кэша → общая таблица
+ *    2,9 %  cpu_get_tb_cpu_state
+ *
+ * То есть на ДИСПЕТЧЕРИЗАЦИЮ уходит больше трети, и заметная часть этого —
+ * промахи кэша переходов. Четыре тысячи ячеек на поток мало для целой системы
+ * Android: у одного лаунчера рабочий набор блоков перевода куда больше.
+ * Шестнадцать тысяч ячеек — это 256 КБ на поток вместо 64 КБ; для стенда, где
+ * гостевых потоков сотни, это десятки мегабайт, и они окупаются.
+ */
+#define TB_JMP_CACHE_BITS 14
+#define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
+
+/*
+ * Accessed in parallel; all accesses to 'tb' must be atomic.
+ * For CF_PCREL, accesses to 'pc' must be protected by a
+ * load_acquire/store_release to 'tb'.
+ */
+struct CPUJumpCache {
+    struct rcu_head rcu;
+    struct {
+        TranslationBlock *tb;
+        vaddr pc;
+    } array[TB_JMP_CACHE_SIZE];
+};
+
+#endif /* ACCEL_TCG_TB_JMP_CACHE_H */

@@ -1,0 +1,58 @@
+This tree is a modified QEMU 8.2.4.
+
+QEMU as a whole is released under the GNU General Public License version 2.
+See COPYING for the full text, LICENSE for the clarification of terms, and
+COPYING.LIB for the parts under the GNU Lesser General Public License.
+
+Files added to linux-user/ by the SENSES project
+------------------------------------------------
+The following files do not exist in upstream QEMU. Each carries its own
+SPDX tag (GPL-2.0-or-later) and its own copyright line at the top:
+
+    linux-user/guest_alarm.c        linux-user/guest_net.c
+    linux-user/guest_ashmem.c       linux-user/guest_oom.c
+    linux-user/guest_binder.c       linux-user/guest_pagelog.c
+    linux-user/guest_fb.c           linux-user/guest_persona.c
+    linux-user/guest_fs.c           linux-user/guest_proc.c
+    linux-user/guest_fwinit.c       linux-user/guest_rlimit.c
+    linux-user/guest_ids.c          linux-user/guest_script.c
+    linux-user/guest_input.c        linux-user/guest_selinux.c
+    linux-user/guest_kill.c         linux-user/guest_tls.c
+    linux-user/guest_trace.c
+
+and the matching headers: guest_*.h.
+
+Modified upstream files
+-----------------------
+Upstream files were edited in place to call into the additions above. The
+calls sit where a syscall or a translation-block event is intercepted; every
+such edit is marked in the source with a comment beginning with a star
+character, so a diff against qemu-8.2.4 upstream shows exactly what changed.
+
+Principal places:
+
+    linux-user/syscall.c            syscall interception and dispatch
+    linux-user/mmap.c               guest address space, ashmem ranges
+    linux-user/elfload.c            guest ELF loading and bionic peculiarities
+    linux-user/main.c               option and environment handling
+    linux-user/linuxload.c          initial stack and argv/envp layout
+    linux-user/arm/cpu_loop.c       ARM-specific traps: cacheflush, set_tls
+    accel/tcg/user-exec.c           page protection for self-modifying code
+
+Note on the NOTICE file
+-----------------------
+The header of every added file says "Everything changed in QEMU is listed in
+NOTICE", but no such file was present in the source tree this snapshot was
+taken from. This file is that missing notice, written from the tree itself
+rather than from the project's own records, so treat it as a description of
+what is here, not as the project's authoritative changelog.
+
+Why this tree is published
+--------------------------
+QEMU is free software: everyone who receives a binary of it is entitled to
+the corresponding source under GPLv2 section 3. This tree is that source for
+the qemu-arm binary that ships with the emulator build it came from.
+
+If you are the copyright holder of an addition in this tree and would like
+the attribution corrected, open an issue — the intent is to comply with the
+licence, not to take anything from anyone.

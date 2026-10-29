@@ -1,0 +1,1058 @@
+/* Code to mangle pathnames into those matching a given prefix.
+   eg. open("/lib/foo.so") => open("/usr/gnemul/i386-linux/lib/foo.so");
+
+   The assumption is that this area does not change.
+*/
+#include "qemu/osdep.h"
+#include <sys/param.h>
+#include <dirent.h>
+#include "qemu/cutils.h"
+#include "qemu/path.h"
+#include "qemu/thread.h"
+
+static const char *base;
+static GHashTable *hash;
+static QemuMutex lock;
+
+/*
+ * Ветви, которые гость считает своими и в которые ПИШЕТ. Их пути уводятся под
+ * корень безусловно, даже если файла там ещё нет: иначе создание уходит
+ * хозяину, где у нас нет прав (в песочнице приложения — Permission denied).
+ *
+ * /proc и /dev целиком сюда НЕ входят намеренно: /proc гостю нужен настоящий
+ * (свой /proc/self и /proc/<pid>; отдельные файлы подменяет сам qemu — см.
+ * linux-user/guest_fs.c), а из /dev под корнем берётся только то, что мы
+ * создали там сами.
+ *
+ * ★ А вот /sys входит целиком (0059): у хозяина он есть всегда, и гость читал
+ * из него аппарат, а писал — в живое устройство. Всё, что гостю правда нужно,
+ * кладёт в дерево Tree.makeSysNodes.
+ */
+static const char *const guest_write_roots[] = {
+    "/data", "/cache", "/mnt", "/tmp", "/sqlite_stmt_journals",
+    /*
+     * ★ /storage — ветвь эмулированного накопителя, новинка 4.x. Зигота на
+     * каждый fork готовит там каталог пользователя
+     * (fs_prepare_dir("/storage/emulated/0")), и без права писать в эту ветвь
+     * mkdir уходит в /storage ХОЗЯИНА, которого нет:
+     *   E cutils   Failed to mkdir(/storage/emulated/0): No such file or directory
+     *   E dalvikvm cannot mountExternalStorage(): No such file or directory
+     *   E dalvikvm VM aborting
+     * — и ни один процесс приложения не выживает. У 2.3 и 4.1 каталога
+     * /storage не было вовсе, поэтому в исходном списке (патч 0004) его нет.
+     */
+    "/storage",
+    /*
+     * ★ /dev/socket — тоже наша ветвь, хотя /dev целиком к ним не отнесён.
+     * Там нет ни одного настоящего устройства: это сокеты служб, которые на
+     * живом устройстве создаёт init, а у нас — guestrun. Безусловный увод нужен
+     * потому, что решения path() кэшируются НАВСЕГДА: гость, спросивший про
+     * сокет до его появления, получил бы хозяйский путь и на второй попытке.
+     */
+    "/dev/socket",
+    /*
+     * ★★★ /sys/fs/selinux — уводим в дерево, где его НЕТ, чтобы гость решил,
+     * что SELinux выключен. Иначе он найдёт хозяйский, поверит в него и
+     * убьёт system_server на смене контекста. Подробности — в шапке патча.
+     */
+    "/sys/fs/selinux",
+    /*
+     * ★★★ /dev/cpuctl — группы планировщика. Тоже уводим в дерево, где их нет.
+     *
+     * libcutils решает, есть ли на устройстве группы планировщика, одной
+     * проверкой пути. Каталог хозяина есть на любом современном Android, и
+     * гость в него верил, после чего `Process.setProcessGroup` бросал
+     * «RuntimeException: Unknown error» без конца — из applyOomAdjLocked, то
+     * есть при КАЖДОЙ переоценке важности процессов, — и один поток
+     * system_server уже умер от необработанного исключения.
+     * Этот же путь ронял system_server при установке любого
+     * приложения — на каждой установке, без исключений.
+     */
+    "/dev/cpuctl",
+    /*
+     * ★★ /proc/net/xt_qtaguid — учёт трафика ядра. Тоже в дерево, где его нет
+     * (регресс 24.09, Р-32).
+     *
+     * Прошивка решает «учёт в ядре есть» ОДНИМ признаком — есть ли
+     * /proc/net/xt_qtaguid/ctrl — и, найдя хозяйский, включала учёт: netd
+     * звал iptables, которого у гостя нет и быть не может, и на каждой
+     * загрузке system_server писал Log.wtf «problem enabling bandwidth
+     * controls». А с пустышкой iptables (у одной из прошивок) учёт
+     * «включался», и гость писал метки своих сокетов в ctrl ЯДРА ТЕЛЕФОНА.
+     * Хуже всего — зависимость от хозяина: у Android 9 файл есть, у Android
+     * 10+ его нет вовсе, и одна и та же прошивка вела себя на двух телефонах
+     * по-разному.
+     *
+     * Теперь ответ один на любом телефоне: учёта нет. Файлы, которые служба
+     * статистики читает (stats, iface_stat_fmt, iface_stat_all), отдаёт
+     * guest_fs.c — он перехватывает open раньше перевода пути.
+     *
+     * ★ Р-129: «учёт есть» у гостя теперь свой (ctrl — память в guest_fs.c, метки
+     * stat/access кладёт стенд в этот каталог дерева), в ядро хозяина запись не
+     * доходит. /dev/xt_qtaguid (его открывает libcutils при net.qtaguid_enabled)
+     * — туда же, а не к устройству хозяина.
+     */
+    "/proc/net/xt_qtaguid",
+    "/dev/xt_qtaguid",
+    /*
+     * ★★★ Ветви ПРОШИВКИ — тоже безусловно в дерево, но по обратной причине:
+     * не ради записи, а чтобы отсутствующий у нас файл честно НЕ НАШЁЛСЯ,
+     * вместо того чтобы найтись У ХОЗЯИНА.
+     *
+     * Поймано на телефоне с ядром 4.9 (Android 9) 2026-09-02: в дереве нет
+     * /vendor/lib/hw/gralloc.default.so, и гость подхватил ХОЗЯЙСКИЙ —
+     * 64-битный модуль телефона:
+     *   E HAL dlopen failed: empty/missing DT_HASH in "gralloc.default.so"
+     *   E SurfaceFlinger gralloc module not found
+     *   E SurfaceFlinger ERROR: failed to open framebuffer, aborting
+     * — и графики на телефоне не было вовсе.
+     *
+     * ⚠️ На телефонах, где 32-битных библиотек нет вовсе (современные телефоны, эмуляторы на
+     * ARM-компьютерах), этого НЕ ВИДНО: открывать там нечего, и гость получает
+     * честный отказ. То есть ошибка вылезает ровно на тех устройствах, где
+     * хозяйские библиотеки гостю по разрядности подходят.
+     *
+     * То же самое ловилось раньше на медиабиблиотеке прошивки: гость брал
+     * хозяйскую библиотеку вместо своей и падал не там, где причина.
+     */
+    "/system", "/vendor", "/odm", "/product", "/system_ext", "/apex",
+    "/etc", "/bin", "/sbin", "/xbin", "/firmware", "/oem",
+    /*
+     * ★★★ /sys целиком — по той же причине, что и ветви прошивки выше: не
+     * ради записи, а чтобы отсутствующий у нас узел честно НЕ НАШЁЛСЯ, вместо
+     * того чтобы найтись у телефона. Заодно закрывает и запись: узел, которого
+     * в дереве нет, гость не создаст — а создав, создаст У СЕБЯ.
+     */
+    "/sys",
+    NULL
+};
+
+/*
+ * ★★★ РЕЖИМ «INIT ПРОШИВКИ» (GUEST_FWINIT=1): /dev гостя — целиком его дерево.
+ *
+ * Настоящий /init монтирует tmpfs на /dev (у нас mount — пустой вызов) и дальше
+ * создаёт там узлы, каталоги, сокеты служб, а потом ждёт их. У хозяина писать в
+ * /dev некуда: у приложения нет прав, у виртуалки это не наш каталог. Поэтому
+ * весь /dev гостя — каталог dev его дерева (его готовит стенд), КРОМЕ безвредных
+ * устройств без состояния: null, zero, full, random, urandom, tty, ptmx, pts —
+ * они остаются хозяйскими. Поддельные устройства (binder, ashmem, кадры, ввод,
+ * журналы) ловятся по ГОСТЕВОМУ имени ещё до перевода пути (guest_binder_try_open
+ * и соседи) и этого не касаются.
+ *
+ * ⚠️ Переменная читается один раз: решения path() кэшируются навсегда, и ответ
+ * для одного пути не должен меняться на лету. Без переменной поведение прежнее.
+ * ⚠️ Условие «GUEST_FWINIT равно 1» записано здесь и в linux-user/guest_fwinit.c
+ * (guest_fwinit): util/ собирается отдельно от linux-user/ и не вправе зависеть
+ * от него, поэтому общей функции нет. Правишь одно — правь и второе.
+ */
+static bool fwinit_dev(const char *name)
+{
+    static int on = -1;
+    static const char *const host_dev[] = {
+        "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
+        "/dev/tty", "/dev/ptmx", "/dev/pts", NULL
+    };
+    int i;
+
+    if (on < 0) {
+        const char *e = getenv("GUEST_FWINIT");
+
+        on = e && strcmp(e, "1") == 0;      /* ровно «1»: «0», «10», «1x» — нет */
+    }
+    if (!on || strncmp(name, "/dev", 4) != 0 ||
+        (name[4] != '/' && name[4] != '\0')) {
+        return false;
+    }
+    for (i = 0; host_dev[i]; i++) {
+        size_t n = strlen(host_dev[i]);
+
+        if (strncmp(name, host_dev[i], n) == 0 &&
+            (name[n] == '/' || name[n] == '\0')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool under_guest_write_root(const char *name)
+{
+    int i;
+
+    if (fwinit_dev(name)) {
+        return true;
+    }
+
+    for (i = 0; guest_write_roots[i]; i++) {
+        size_t n = strlen(guest_write_roots[i]);
+
+        if (strncmp(name, guest_write_roots[i], n) == 0 &&
+            (name[n] == '/' || name[n] == '\0')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * ★★★ Общая папка: свой перевод пути. Подробности — в заголовке патча 0041.
+ */
+static const char *sdcard_base;
+
+/*
+ * ★★★★★ ГОСТЬ НЕ ВЫХОДИТ ИЗ СВОЕГО ДЕРЕВА (регресс 24.09, Р-2).
+ *
+ * Перевод пути был только для АБСОЛЮТНЫХ имён и без сведения «..». Замер
+ * изнутри гостя на телефоне (все три прошивки):
+ *
+ *   cd /data; ls ../..        → все контейнеры и снимки песочницы стенда
+ *   ls ../../../keys           → ключ подписи связок
+ *   ls /data/../../../keys     → то же абсолютным путём
+ *   ls /proc/self/root/sdcard/ → весь накопитель телефона
+ *   ls /proc/self/cwd/         → закрытые файлы стенда (рабочий каталог
+ *                                каждого процесса гостя — files/bin)
+ *
+ * Причины: относительный путь и «..» разрешало ядро телефона от НАСТОЯЩЕГО
+ * рабочего каталога; `g_build_filename(корень, "/data/../../..")` уводил за
+ * корень; `/proc/<процесс>/{root,cwd}` вели к хозяйским путям.
+ *
+ * Теперь:
+ *  * у гостя свой рабочий каталог (guest_cwd), гостевым путём; относительное
+ *    имя приклеивается к нему, а не к настоящему;
+ *  * любой путь сводится по буквам (norm), и «..» не поднимается выше «/»;
+ *  * `/proc/<свой|число>/root…` — корень гостя, `…/cwd…` — его каталог;
+ *  * вызовы с каталогом-описателем (`openat` и родня) — через path_at: каталог
+ *    описателя переводится обратно в гостевой путь и приклеивается так же;
+ *  * `readlink` отдаёт гостю гостевой путь, а не хозяйский (path_link_to_guest),
+ *    и ссылки, которые гость создаёт с абсолютной целью, ведут в дерево.
+ *
+ * ⚠️ Сведение — по буквам, как у общей папки (0041): «..» после ссылки на
+ * каталог снимает саму ссылку, а не уходит в родителя её цели. Для гостя это
+ * безопасная сторона.
+ */
+static char *base_real;          /* корень по realpath: /data/data/… против /data/user/0/… */
+static char *sdcard_real;
+static char *guest_cwd;          /* гостевой путь, всегда сведён */
+/*
+ * ★ Каталоги самого стенда (регресс 24.09, Р-28): дом приложения (`<дом>` из
+ * `<дом>/files/roots/N`, по заданному имени и по настоящему) и его пакет
+ * (`/data/app/<пакет>-…`). Цели ссылок, ведущие туда, гостю незачем: это
+ * журналы самого транслятора, открытые в каждом процессе гостя, и сам
+ * транслятор. См. path_link_to_guest.
+ */
+static char *stand_home[2];
+static char *stand_apk;
+static QemuMutex cwd_lock;
+
+static bool has_prefix(const char *s, const char *pre, const char **rest)
+{
+    size_t n = strlen(pre);
+
+    if (strncmp(s, pre, n) != 0 || (s[n] != '/' && s[n] != '\0')) {
+        return false;
+    }
+    if (rest) {
+        *rest = s + n;
+    }
+    return true;
+}
+
+/* Свести гостевой абсолютный путь: «.», «..», повторные «/»; выше «/» не выйти. */
+static char *norm(const char *abs)
+{
+    GString *out = g_string_new("");
+    const char *p = abs;
+
+    while (*p) {
+        const char *seg;
+        size_t len;
+
+        while (*p == '/') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        len = p - seg;
+        if (len == 1 && seg[0] == '.') {
+            continue;
+        }
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            char *slash = strrchr(out->str, '/');
+
+            if (slash) {
+                g_string_truncate(out, slash - out->str);
+            }
+            continue;
+        }
+        g_string_append_c(out, '/');
+        g_string_append_len(out, seg, len);
+    }
+    if (out->len == 0) {
+        g_string_append_c(out, '/');
+    }
+    return g_string_free(out, FALSE);
+}
+
+/*
+ * Уже сведённый абсолютный путь вне /proc — такой ищем как есть, без
+ * выделения памяти: это горячая дорога (каждый open и stat гостя).
+ */
+static bool is_clean(const char *s)
+{
+    const char *p;
+
+    if (s[0] != '/' || strncmp(s, "/proc/", 6) == 0) {
+        return false;
+    }
+    for (p = s; *p; p++) {
+        if (p[0] == '/' &&
+            (p[1] == '/' ||
+             (p[1] == '.' && (p[2] == '/' || p[2] == '\0' ||
+                              (p[2] == '.' && (p[3] == '/' || p[3] == '\0')))))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *cwd_get(void)
+{
+    char *c;
+
+    qemu_mutex_lock(&cwd_lock);
+    c = g_strdup(guest_cwd ? guest_cwd : "/");
+    qemu_mutex_unlock(&cwd_lock);
+    return c;
+}
+
+static void cwd_set(char *c)
+{
+    qemu_mutex_lock(&cwd_lock);
+    g_free(guest_cwd);
+    guest_cwd = c;
+    qemu_mutex_unlock(&cwd_lock);
+}
+
+static void stand_marks(const char *root)
+{
+    const char *f = strstr(root, "/files/");
+    int i;
+
+    if (!f || f == root) {
+        return;
+    }
+    for (i = 0; i < 2 && stand_home[i]; i++) {
+    }
+    if (i == 2) {
+        return;
+    }
+    stand_home[i] = g_strndup(root, f - root);
+    if (!stand_apk) {
+        const char *pkg = strrchr(stand_home[i], '/');
+
+        if (pkg && pkg[1]) {
+            stand_apk = g_strconcat("/data/app/", pkg + 1, "-", NULL);
+        }
+    }
+}
+
+static bool stand_path(const char *host)
+{
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        if (stand_home[i] && has_prefix(host, stand_home[i], NULL)) {
+            return true;
+        }
+    }
+    return stand_apk && strncmp(host, stand_apk, strlen(stand_apk)) == 0;
+}
+
+/*
+ * ★ Патч 0094: служебное стенда за описателем (Р-101, 7.x).
+ *
+ * Зигота 7.x перед ветвлением обходит /proc/self/fd и каждый описатель сверяет
+ * с белым списком (`/dev/null`, банки `/system/framework`…); чужой — смерть
+ * всей зиготы («Not whitelisted : /guest.owners», «Unable to construct file
+ * descriptor table»). У аппарата служебных описателей в процессе нет вовсе, а у
+ * нас каждый процесс гостя держит открытыми то, что принадлежит стенду:
+ * журналы транслятора (дом стенда, см. stand_path) и карту владельцев с
+ * прочими служебными файлами корня дерева (`<корень>/guest.*`). Такие описатели
+ * гостю не показываются в списке (guest_proc.c); сами они живы.
+ */
+bool path_is_stand_plumbing(const char *host)
+{
+    const char *rest;
+
+    if (!host || host[0] != '/') {
+        return false;
+    }
+    /*
+     * ★ Дерево ПЕРВЫМ (проверка r100, К-1). Дерево лежит ВНУТРИ дома стенда
+     * (`<дом>/files/roots/N`), и stand_path истинно для любого его файла: при
+     * обратном порядке гость не видел описателей ВСЕХ файлов дерева (банок,
+     * баз, журналов приложений). В дереве служебные — только `guest.*` корня;
+     * всё прочее в нём — описатели гостя. Порядок — как у path_link_to_guest
+     * (0068): сперва path_to_guest, дом стенда — лишь вне дерева.
+     */
+    if (base && (has_prefix(host, base, &rest) ||
+                 (base_real && has_prefix(host, base_real, &rest)))) {
+        return strncmp(rest, "/guest.", 7) == 0 && strchr(rest + 1, '/') == NULL;
+    }
+    /*
+     * Общая папка — тоже файлы гостя, даже когда она сама в доме стенда
+     * (запасное место `<дом>/files/sdcard`, если накопитель телефона не
+     * пишется): path_link_to_guest переводит её раньше дома стенда.
+     */
+    if (sdcard_base && (has_prefix(host, sdcard_base, NULL) ||
+                        (sdcard_real && has_prefix(host, sdcard_real, NULL)))) {
+        return false;
+    }
+    return stand_path(host);
+}
+
+/* Хозяйский путь → гостевой; NULL — он вне дерева и общей папки. */
+char *path_to_guest(const char *host)
+{
+    const char *rest;
+
+    if (!host || host[0] != '/') {
+        return NULL;
+    }
+    if (base && (has_prefix(host, base, &rest) ||
+                 (base_real && has_prefix(host, base_real, &rest)))) {
+        return g_strdup(*rest ? rest : "/");
+    }
+    if (sdcard_base && (has_prefix(host, sdcard_base, &rest) ||
+                        (sdcard_real && has_prefix(host, sdcard_real, &rest)))) {
+        return g_strconcat("/mnt/sdcard", rest, NULL);
+    }
+    return NULL;
+}
+
+static bool all_digits(const char *s, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (!g_ascii_isdigit(s[i])) {
+            return false;
+        }
+    }
+    return n > 0;
+}
+
+/*
+ * `/proc/<self|thread-self|число>[/task/<число>]/root[/…]` — корень ГОСТЯ;
+ * `…/cwd[/…]` — рабочий каталог гостя (свой — из guest_cwd, чужой — обратным
+ * переводом его ссылки). Путь уже сведён; вход принадлежит нам.
+ */
+static char *proc_links(char *abs)
+{
+    const char *who, *slash, *p, *rest;
+    size_t wl;
+    bool self;
+
+    if (strncmp(abs, "/proc/", 6) != 0) {
+        return abs;
+    }
+    who = abs + 6;
+    slash = strchr(who, '/');
+    if (!slash) {
+        return abs;
+    }
+    wl = slash - who;
+    self = (wl == 4 && !strncmp(who, "self", 4)) ||
+           (wl == 11 && !strncmp(who, "thread-self", 11));
+    if (!self && !all_digits(who, wl)) {
+        return abs;
+    }
+    if (!self && (pid_t)atoi(who) == getpid()) {
+        self = true;
+    }
+    p = slash + 1;
+    if (strncmp(p, "task/", 5) == 0) {
+        const char *q = strchr(p + 5, '/');
+
+        if (!q) {
+            return abs;
+        }
+        p = q + 1;
+    }
+    if (has_prefix(p, "root", &rest)) {
+        char *r = norm(*rest ? rest : "/");
+
+        g_free(abs);
+        return r;
+    }
+    if (has_prefix(p, "cwd", &rest)) {
+        char *dir = NULL, *j, *r;
+
+        if (self) {
+            dir = cwd_get();
+        } else {
+            char link[64], host[PATH_MAX];
+            ssize_t n;
+
+            snprintf(link, sizeof link, "/proc/%.*s/cwd", (int)wl, who);
+            n = readlink(link, host, sizeof host - 1);
+            if (n > 0) {
+                host[n] = '\0';
+                dir = path_to_guest(host);
+            }
+            if (!dir) {
+                dir = g_strdup("/");
+            }
+        }
+        j = g_strconcat(dir, "/", rest, NULL);
+        r = norm(j);
+        g_free(j);
+        g_free(dir);
+        g_free(abs);
+        return r;
+    }
+    return abs;
+}
+
+/* Гостевой абсолютный путь для имени: относительное — от рабочего каталога гостя. */
+static char *absolute(const char *name)
+{
+    char *j, *r;
+
+    if (name[0] == '/') {
+        j = g_strdup(name);
+    } else {
+        char *c = cwd_get();
+
+        j = g_strconcat(c, "/", name, NULL);
+        g_free(c);
+    }
+    r = norm(j);
+    g_free(j);
+    return proc_links(r);
+}
+
+/*
+ * ⚠️ Порядок ВАЖЕН: сначала длинные имена. Иначе `/storage/emulated/0` попало
+ * бы под правило для `/storage/emulated` (если его когда-нибудь добавят) и
+ * превратилось бы в «<папка>/0».
+ */
+static const char *const sdcard_names[] = {
+    "/storage/emulated/legacy",
+    "/mnt/shell/emulated/0",
+    "/storage/emulated/0",
+    "/storage/sdcard0",
+    "/mnt/sdcard",
+    "/sdcard",
+    NULL
+};
+
+static bool sdcard_prefix(const char *name, const char **rest)
+{
+    int i;
+
+    for (i = 0; sdcard_names[i]; i++) {
+        size_t n = strlen(sdcard_names[i]);
+
+        if (strncmp(name, sdcard_names[i], n) == 0 &&
+            (name[n] == '/' || name[n] == '\0')) {
+            *rest = name + n;
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *sdcard_map(const char *rest)
+{
+    GString *out = g_string_new(sdcard_base);
+    size_t root = strlen(sdcard_base);
+    const char *p = rest;
+
+    while (*p) {
+        const char *seg;
+        size_t len;
+
+        while (*p == '/') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        len = p - seg;
+        if (len == 1 && seg[0] == '.') {
+            continue;
+        }
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            char *slash = strrchr(out->str + root, '/');
+
+            if (slash) {                      /* выше корня не поднимаемся */
+                g_string_truncate(out, slash - out->str);
+            }
+            continue;
+        }
+        g_string_append_c(out, '/');
+        g_string_append_len(out, seg, len);
+    }
+    return g_string_free(out, FALSE);
+}
+
+/*
+ * ★★★ selinuxfs для «SELinux всё разрешено» (GUEST_FWINIT=1 И GUEST_SELINUX=1):
+ * гостевой /sys/fs/selinux — НАСТОЯЩИЙ каталог <корень>/dev/.selinuxfs, который
+ * заводит сам транслятор (linux-user/guest_selinux.c). Не sys/fs/selinux дерева:
+ * там у 2.3–4.4 ничего быть не должно (гость решил бы, что SELinux включён), а
+ * dev гостя — его tmpfs, стенд очищает его перед «Пуском» (состояние selinuxfs
+ * живёт ровно до следующей загрузки, как у ядра).
+ *
+ * path_selinuxfs_touch — подключаемый вызов транслятора: на ПЕРВОЕ обращение к
+ * каждому имени под selinuxfs (ответы path() кэшируются) он заводит то, что
+ * создаётся по требованию — каталог класса class/<класс>. Зовётся под замком
+ * path(): внутри нельзя вызывать path().
+ *
+ * ⚠️ Условие «GUEST_FWINIT равно 1 и GUEST_SELINUX равно 1» записано здесь и в
+ * linux-user/guest_selinux.c (guest_selinux): util/ собирается отдельно от
+ * linux-user/ и не вправе зависеть от него. Правишь одно — правь и второе.
+ */
+void (*path_selinuxfs_touch)(const char *rest);
+
+static bool selinuxfs_rest(const char *name, const char **rest)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *fw = getenv("GUEST_FWINIT");
+        const char *se = getenv("GUEST_SELINUX");
+
+        on = fw && strcmp(fw, "1") == 0 && se && strcmp(se, "1") == 0;
+    }
+    return on && has_prefix(name, "/sys/fs/selinux", rest);
+}
+
+void init_paths(const char *prefix)
+{
+    sdcard_base = getenv("GUEST_SDCARD");
+    if (sdcard_base && !sdcard_base[0]) {
+        sdcard_base = NULL;
+    }
+
+    if (prefix[0] == '\0' || !strcmp(prefix, "/")) {
+        return;
+    }
+
+    if (prefix[0] == '/') {
+        base = g_strdup(prefix);
+    } else {
+        char *cwd = g_get_current_dir();
+        base = g_build_filename(cwd, prefix, NULL);
+        g_free(cwd);
+    }
+
+    hash = g_hash_table_new(g_str_hash, g_str_equal);
+    qemu_mutex_init(&lock);
+    qemu_mutex_init(&cwd_lock);
+
+    /*
+     * ★ Ядро отдаёт пути по настоящему имени: ссылки `/proc/self/fd/N` у нас
+     * начинаются с `/data/data/…`, а корень задан как `/data/user/0/…`. Для
+     * обратного перевода нужны оба.
+     */
+    {
+        char *r = realpath(base, NULL);
+
+        if (r && strcmp(r, base) != 0) {
+            base_real = g_strdup(r);
+        }
+        free(r);
+        stand_marks(base);
+        if (base_real) {
+            stand_marks(base_real);
+        }
+        if (sdcard_base) {
+            r = realpath(sdcard_base, NULL);
+            if (r && strcmp(r, sdcard_base) != 0) {
+                sdcard_real = g_strdup(r);
+            }
+            free(r);
+        }
+    }
+    /*
+     * ★ Рабочий каталог гостя — из настоящего. Он наследуется через execve
+     * (дочерний qemu заходит сюда заново), а гость, ни разу не звавший chdir,
+     * живёт в «/»: настоящий каталог у него — files/bin стенда, вне дерева.
+     */
+    {
+        char *host = g_get_current_dir();
+        char *g = path_to_guest(host);
+
+        guest_cwd = g ? norm(g) : g_strdup("/");
+        g_free(g);
+        g_free(host);
+    }
+}
+
+/*
+ * Look for path in emulation dir, otherwise return the (normalised) name.
+ *
+ * ★ Имя — гостевое: абсолютное или относительное (от рабочего каталога
+ * гостя, см. шапку про Р-2). Возвращаемая строка живёт вечно (в таблице).
+ */
+const char *path(const char *name)
+{
+    gpointer key, value;
+    const char *ret;
+    char *abs = NULL;
+    const char *look;
+
+    if (!base || !name || name[0] == '\0') {
+        return name;
+    }
+    if (is_clean(name)) {
+        look = name;                    /* горячая дорога: без выделения памяти */
+    } else {
+        abs = absolute(name);
+        look = abs;
+    }
+
+    qemu_mutex_lock(&lock);
+
+    /* Have we looked up this file before?  */
+    if (g_hash_table_lookup_extended(hash, look, &key, &value)) {
+        ret = value ? value : (const char *)key;
+        g_free(abs);
+    } else {
+        char *save = abs ? abs : g_strdup(name);
+        const char *rest;
+        char *full;
+
+        if (selinuxfs_rest(save, &rest)) {
+            /* ★ selinuxfs (патч 0084): каталог транслятора в dev дерева. */
+            full = g_strconcat(base, "/dev/.selinuxfs", rest, NULL);
+            if (path_selinuxfs_touch) {
+                path_selinuxfs_touch(rest);
+            }
+        } else if (sdcard_base && sdcard_prefix(save, &rest)) {
+            /* ★ Общая папка — свой перевод, см. sdcard_map. */
+            full = sdcard_map(rest);
+        } else {
+            full = g_build_filename(base, save, NULL);
+            /*
+             * Есть под корнем — берём. Нет, но это своя ветвь гостя (патчи
+             * 0004 и 0026) — тоже берём: создавать надо ПОД КОРНЕМ, а не у
+             * хозяина. Иначе пусть идёт как есть.
+             */
+            if (access(full, F_OK) != 0 && !under_guest_write_root(save)) {
+                g_free(full);
+                full = NULL;
+            }
+        }
+        g_hash_table_insert(hash, save, full);
+        ret = full ? full : save;
+    }
+
+    qemu_mutex_unlock(&lock);
+    return ret;
+}
+
+/*
+ * То же для вызовов с каталогом-описателем (`openat`, `fstatat`, `unlinkat`…).
+ * Относительное имя приклеивается к ГОСТЕВОМУ пути этого каталога: иначе
+ * `openat(fd, "../../..")` поднимался бы из дерева ядром телефона.
+ */
+const char *path_at(int dirfd, const char *name)
+{
+    char link[64], host[PATH_MAX], *dir, *j;
+    const char *r;
+    ssize_t n;
+
+    if (!base || !name || name[0] == '\0' || name[0] == '/' || dirfd == AT_FDCWD) {
+        return path(name);
+    }
+    snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
+    n = readlink(link, host, sizeof host - 1);
+    if (n <= 0) {
+        return name;                    /* не описатель каталога — решит ядро */
+    }
+    host[n] = '\0';
+    dir = path_to_guest(host);
+    if (!dir) {
+        dir = g_strdup(host);           /* вне дерева (/proc, /dev) — у гостя тот же */
+    }
+    j = g_strconcat(dir, "/", name, NULL);
+    r = path(j);
+    g_free(j);
+    g_free(dir);
+    return r;
+}
+
+/*
+ * ★ САМИ ССЫЛКИ `/proc/<процесс>[/task/<поток>]/root` и `…/cwd`, без хвоста
+ * (регресс 24.09, Р-24). path() ведёт гостя СКВОЗЬ них — в его корень и его
+ * каталог (proc_links), и вызовам, которые ссылку проходят (open, stat, chdir),
+ * это верно. А readlink и lstat последнюю ссылку не проходят: ядро ответило бы
+ * «это ссылка» и её целью, мы же отвечали «каталог» и отказом — `readlink
+ * /proc/self/cwd` выходил с кодом 1, `ls -ld` показывал каталог.
+ *
+ * Имя гостевое, от dirfd — как у path_at. 1 — это такая ссылка: *target — её
+ * цель гостевым путём (g_free), host — путь к настоящей ссылке у ядра (номера
+ * процессов у гостя и хозяина одни и те же), для lstat. 0 — не она.
+ */
+static int proc_link_at(int dirfd, const char *name, char **target,
+                        char *host, size_t cap)
+{
+    const char *last, *who, *slash, *p;
+    char *j, *a;
+    struct stat st;
+    size_t wl;
+    bool self;
+    int ok = 0;
+
+    if (!base || !name || !name[0]) {
+        return 0;
+    }
+    /* Горячая дорога (каждый lstat гостя): последнее звено — не root и не cwd. */
+    last = strrchr(name, '/');
+    last = last ? last + 1 : name;
+    if (strcmp(last, "root") != 0 && strcmp(last, "cwd") != 0) {
+        return 0;
+    }
+    if (name[0] == '/') {
+        j = g_strdup(name);
+    } else if (dirfd == AT_FDCWD) {
+        char *c = cwd_get();
+
+        j = g_strconcat(c, "/", name, NULL);
+        g_free(c);
+    } else {
+        char link[64], h[PATH_MAX], *dir;
+        ssize_t n;
+
+        snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
+        n = readlink(link, h, sizeof h - 1);
+        if (n <= 0) {
+            return 0;
+        }
+        h[n] = '\0';
+        dir = path_to_guest(h);
+        j = g_strconcat(dir ? dir : h, "/", name, NULL);
+        g_free(dir);
+    }
+    a = norm(j);
+    g_free(j);
+
+    if (strncmp(a, "/proc/", 6) != 0) {
+        goto out;
+    }
+    who = a + 6;
+    slash = strchr(who, '/');
+    if (!slash) {
+        goto out;
+    }
+    wl = slash - who;
+    self = (wl == 4 && !strncmp(who, "self", 4)) ||
+           (wl == 11 && !strncmp(who, "thread-self", 11));
+    if (!self && !all_digits(who, wl)) {
+        goto out;
+    }
+    if (!self && (pid_t)atoi(who) == getpid()) {
+        self = true;
+    }
+    p = slash + 1;
+    if (strncmp(p, "task/", 5) == 0) {
+        const char *q = strchr(p + 5, '/');
+
+        if (!q || !all_digits(p + 5, q - (p + 5))) {
+            goto out;
+        }
+        p = q + 1;
+    }
+    if (strcmp(p, "root") != 0 && strcmp(p, "cwd") != 0) {
+        goto out;
+    }
+    /* Процесса нет или это не ссылка — пусть ответит ядро, как ответило бы. */
+    if (strlen(a) >= cap || lstat(a, &st) != 0 || !S_ISLNK(st.st_mode)) {
+        goto out;
+    }
+    if (p[0] == 'r') {
+        *target = g_strdup("/");        /* корень у всех процессов гостя — его дерево */
+    } else if (self) {
+        *target = cwd_get();
+    } else {
+        char h[PATH_MAX];
+        ssize_t n = readlink(a, h, sizeof h - 1);
+
+        if (n <= 0) {
+            goto out;
+        }
+        h[n] = '\0';
+        *target = path_to_guest(h);
+        if (!*target) {
+            *target = g_strdup("/");    /* каталог вне дерева гостю не показываем */
+        }
+    }
+    memcpy(host, a, strlen(a) + 1);
+    ok = 1;
+out:
+    g_free(a);
+    return ok;
+}
+
+/* readlink гостя: 1 — это ссылка /proc/…/root|cwd, в *target её цель (g_free). */
+int path_proc_readlink_at(int dirfd, const char *name, char **target)
+{
+    char h[PATH_MAX];
+
+    return proc_link_at(dirfd, name, target, h, sizeof h);
+}
+
+/*
+ * Путь для вызова, который последнюю ссылку НЕ проходит (lstat, fstatat с
+ * AT_SYMLINK_NOFOLLOW): сама ссылка /proc/…/root|cwd — настоящая ссылка у ядра,
+ * остальное — как path_at. Строка живёт до следующего вызова в этом потоке.
+ */
+const char *path_nofollow_at(int dirfd, const char *name)
+{
+    static __thread char h[PATH_MAX];
+    char *t;
+
+    if (proc_link_at(dirfd, name, &t, h, sizeof h)) {
+        g_free(t);
+        return h;
+    }
+    return path_at(dirfd, name);
+}
+
+/* chdir гостя: настоящий каталог — в дерево, гостевой — запомнить. */
+int path_chdir(const char *name)
+{
+    char *abs;
+    int r;
+
+    if (!base || !name || name[0] == '\0') {
+        return chdir(name);
+    }
+    abs = absolute(name);
+    r = chdir(path(abs));
+    if (r == 0) {
+        cwd_set(abs);
+    } else {
+        g_free(abs);
+    }
+    return r;
+}
+
+/* fchdir гостя удался — гостевой каталог по пути описателя. */
+void path_fchdir_done(int fd)
+{
+    char link[64], host[PATH_MAX], *g;
+    ssize_t n;
+
+    if (!base) {
+        return;
+    }
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    n = readlink(link, host, sizeof host - 1);
+    if (n <= 0) {
+        return;
+    }
+    host[n] = '\0';
+    g = path_to_guest(host);
+    if (g) {
+        char *c = norm(g);
+
+        g_free(g);
+        cwd_set(c);
+    } else {
+        cwd_set(g_strdup(host));
+    }
+}
+
+/* getcwd гостя: его каталог, а не files/bin стенда. Длина с нулём или -1. */
+ssize_t path_getcwd(char *buf, size_t size)
+{
+    char *c;
+    size_t n;
+
+    if (!base) {
+        return getcwd(buf, size) ? (ssize_t)strlen(buf) + 1 : -1;
+    }
+    c = cwd_get();
+    n = strlen(c) + 1;
+    if (n > size) {
+        g_free(c);
+        errno = ERANGE;
+        return -1;
+    }
+    memcpy(buf, c, n);
+    g_free(c);
+    return (ssize_t)n;
+}
+
+/*
+ * Ответ `readlink` — гостю гостевым путём: ссылки `/proc/<процесс>/fd/N`, `…/cwd`, а
+ * также ссылки, которые гость создал с абсолютной целью (path_link_target),
+ * у ядра указывают на хозяйские пути дерева. Возвращает новую длину.
+ */
+ssize_t path_link_to_guest(char *buf, ssize_t len, size_t cap)
+{
+    char tmp[PATH_MAX], *g;
+    size_t n;
+
+    if (!base || len <= 0 || (size_t)len >= sizeof tmp || buf[0] != '/') {
+        return len;
+    }
+    memcpy(tmp, buf, len);
+    tmp[len] = '\0';
+    g = path_to_guest(tmp);
+    if (!g) {
+        if (!stand_path(tmp)) {
+            return len;
+        }
+        /*
+         * ★ Каталог стенда (Р-28): гость видел в `/proc/<pid>/fd` журналы
+         * самого транслятора (`<дом>/files/bin/binder-warn.log`) — с именем
+         * нашего пакета. Такой описатель у настоящего аппарата не бывает
+         * вовсе; ближе всего к правде — «/dev/null», как у вывода служб.
+         */
+        g = g_strdup("/dev/null");
+    }
+    n = strlen(g);
+    if (n > cap) {
+        n = cap;
+    }
+    memcpy(buf, g, n);
+    g_free(g);
+    return (ssize_t)n;
+}
+
+/*
+ * Цель ссылки, которую создаёт гость. Абсолютную цель ядро разрешило бы от
+ * корня ТЕЛЕФОНА (так `installd` делает `/data/data/<пакет>/lib ->
+ * /data/app-lib/<пакет>`, и у ядра это хозяйский путь) — пишем её переведённой,
+ * в дерево; readlink отдаст гостю её обратно гостевой (path_link_to_guest).
+ */
+const char *path_link_target(const char *target)
+{
+    if (!base || !target || target[0] != '/') {
+        return target;
+    }
+    return path(target);
+}
+
+/*
+ * Корень для дочернего qemu. Гостевой execve пересобирается на вызов самого
+ * себя (см. linux-user/syscall.c), и ребёнку нужно передать тот же -L. База
+ * лежит в статической переменной этого файла, поэтому доступ — отсюда.
+ */
+const char *path_prefix(void)
+{
+    return base;
+}
