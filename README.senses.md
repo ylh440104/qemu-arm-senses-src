@@ -41,10 +41,11 @@ this publish keeps those headers intact and adds nothing to them.
 Fixes on top of this tree
 -------------------------
 
-`patches/` holds changes made after the tree was published — the bugs that
-only reproduce in the compiled binary get fixed here, with the reasoning
-written down next to the diff. See `patches/README.md` for what each one does
-and how to apply it.
+`patches/` is where changes made after this publish would go. It currently
+holds no patch: one was written, tested, and withdrawn, and `patches/README.md`
+records what it claimed, why the claim was plausible, and the measurement that
+falsified it. Read that before assuming a crash here is a stale-translation
+problem.
 
 How to build
 ------------

@@ -1,65 +1,59 @@
-Patches on top of the SENSES tree
-=================================
+What was ruled out, so nobody repeats it
+========================================
 
-The tree in this repository is the one the shipped `qemu-arm` is built from.
-Patches here are applied on top of it, not on top of upstream QEMU.
+This file replaces a patch that was published here for a few hours and then
+withdrawn. It is worth writing down why, because the reasoning that produced
+it is convincing right up to the point where it meets a test.
 
-They exist for one reason: the binary is what people actually run, and a bug
-in it can only be fixed here. Editing the tree in place and rebuilding works
-too — these files are for keeping the change legible and separate.
+The claim
+---------
 
-Applying
---------
-
-    git am patches/*.patch          # keeps author and message
-    # or
-    patch -p1 < patches/0001-cacheflush.patch
-
-Both were checked against the tree as published.
-
-What is here
-------------
-
-**0001-cacheflush.patch** — `linux-user/arm/cpu_loop.c`
-
-`cacheflush` is the syscall a program uses to say "the code at this address
-changed, drop whatever you translated from it". qemu's answer to it was a bare
-success with the request dropped, on the grounds that Dalvik's JIT calls it for
-every method it compiles and the invalidation costs something.
-
-The reasoning holds for the JIT. It does not hold for a program that assembles
-code and enters it through a function pointer, which is what the syscall is
-for. PixelFlinger is that program on Android 1.0–2.x: it builds a scanline
-routine in the heap, announces it, jumps in.
-
-Seen from outside, the ignored announcement looks like this:
+PixelFlinger assembles scanline routines into the heap and enters them through
+a function pointer. When it crashed, the reports looked like this:
 
     PC=0x001a84b8  [guest: rw-] in 0000a000-001ad000 rw-p
     qemu: bytes at PC: 43f0 e92d 2344 e590 1348 e590
     qemu: LR=0xacf0afe4  libpixelflinger.so
 
-The address is different on every run; the bytes at that address are identical
-to the byte; and the instruction that faults is not one the assembler emits.
-That combination means the guest ran a translation built before the code was
-written there — not the bytes it just produced.
+Eight runs, eight different fault addresses, and the same four words at every
+one of them. The instruction those words decode to — `ldr r4, [r0, #-0x423]`,
+a large negative unaligned offset — is not something an assembler emits for a
+scanline loop. From that it is a short step to: qemu is not executing these
+bytes, it is executing a translation it built for this memory earlier, and the
+`cacheflush` that should have dropped that translation was answered with a bare
+success.
 
-The patch invalidates the named range unconditionally. Cost was the original
-objection, so it is worth being exact about where the cost lands: a page that
-was just written has no translation yet, `tb_invalidate_phys_range` finds no
-PageDesc for it and returns without taking the page collection lock. A page the
-JIT has already executed has one, and pays. The bill goes to the JIT, which is
-where the original decision wanted it, and not to the assembler, which cannot
-work without it.
+The step is plausible and it is wrong.
 
-`GUEST_TBFLUSH` still overrides for measurement: unset for the behaviour above,
-`1` for a full `tb_flush` on every call.
+The test
+--------
 
-Not fixed by this
------------------
+Two programs, both mapped RWX, both writing `mov r0,#7; bx lr`, calling it,
+rewriting it to `mov r0,#9; bx lr`, calling `cacheflush`, and calling it again.
+The second one enters through `mov lr,pc; ldr pc,[r4]` — the same shape as
+`ggl_init_scanline` at 0xafdc/0xafe0 — rather than through a direct `blx`.
 
-Whether the patch is enough is not established. An assembly routine can be
-entered on a thread while another thread holds a translation of the same
-addresses, and user mode has no way to stop a thread in the middle of a block;
-that race is what the comments in `cpu_loop.c` describe from earlier attempts.
-PixelFlinger calls this from one thread, so the race should not apply to it —
-but that is an expectation, not a measurement.
+    direct call,   unmodified qemu-arm:  first 7, second 9   OK
+    direct call,   patched qemu-arm:     first 7, second 9   OK
+    indirect call, unmodified qemu-arm:  first 7, second 9   OK
+
+qemu's own self-modifying-code tracking — the write protection on translated
+pages — already covers both entry paths. `cacheflush` is not load-bearing here,
+and the patch that made it invalidate unconditionally bought nothing while
+charging Dalvik's JIT a page-collection lock on every compiled method.
+
+So the fault signature above has some other cause. What it does not tell you is
+that translations are stale; it only tells you the guest ended up at a heap
+address whose contents do not execute as the code that was written there.
+
+What this means for the next attempt
+------------------------------------
+
+The signature is still evidence. Eight runs, same bytes, different addresses,
+energy concentrated in `libagl → libpixelflinger → libsurfaceflinger`, all of
+it on the composite path. What it is evidence *of* is still open, and the next
+step should be a measurement rather than another inference: dump the bytes
+around the fault address together with the surrounding heap, and look at what
+the assembler actually placed there before assuming what did.
+
+If you are here looking for a fix, there is not one in this directory yet.
