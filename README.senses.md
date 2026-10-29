@@ -38,6 +38,14 @@ already carries in its own header. Every one of those files declares
 `SPDX-License-Identifier: GPL-2.0-or-later` and names its copyright holder;
 this publish keeps those headers intact and adds nothing to them.
 
+Fixes on top of this tree
+-------------------------
+
+`patches/` holds changes made after the tree was published — the bugs that
+only reproduce in the compiled binary get fixed here, with the reasoning
+written down next to the diff. See `patches/README.md` for what each one does
+and how to apply it.
+
 How to build
 ------------
 
